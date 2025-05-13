@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Cam Server</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+</head>
+<body>
+  <h1>Live Webcam Feed / Snapshots</h1>
+
+  <button onclick="switchView('live')">Live View</button>
+  <button onclick="switchView('snapshots')">Snapshots</button>
+  <button onclick="switchView('timelapse')">Timelapse</button>
+  <div id="viewer">
+    <img id="snapshot" src="/snapshot" style="max-width:100%;">
+  </div>
+
+  <script>
+    function switchView(view) {
+      const viewer = document.getElementById('viewer');
+
+      if (view === 'live') {
+        viewer.innerHTML = '<video id="hls-video" controls autoplay style="max-width:100%;"></video>';
+        const video = document.getElementById('hls-video');
+        const videoSrc = '/static/hls/stream.m3u8';
+
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hls.loadSource(videoSrc);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = videoSrc;
+          video.addEventListener('loadedmetadata', () => video.play());
+        } else {
+          viewer.innerHTML = '<p>HLS not supported on this browser.</p>';
+        }
+
+      } else if (view === 'snapshots') {
+        viewer.innerHTML = "<h2>Snapshots (One per hour)</h2><div id='gallery'></div>";
+        fetch('/snapshots')
+          .then(response => response.json())
+          .then(images => {
+            const gallery = document.getElementById('gallery');
+            images.forEach(src => {
+              const img = document.createElement('img');
+              img.src = src;
+              img.style = "width: 150px; margin: 5px; border-radius: 10px;";
+              gallery.appendChild(img);
+            });
+          });
+      }
+	else if (view === 'timelapse') {
+  viewer.innerHTML = "<h2>Timelapse videos</h2><div id='tl-gallery'></div>";
+  fetch('/timelapses')
+    .then(r => r.json())
+    .then(videos => {
+      const g = document.getElementById('tl-gallery');
+      videos.forEach(src => {
+        const v = document.createElement('video');
+        v.src = src;
+        v.controls = true;
+        v.loop = true;
+        v.style = "width: 320px; margin: 5px; border-radius: 10px;";
+        g.appendChild(v);
+      });
+    });
+}   
+    }
+
+    setInterval(() => {
+      const img = document.getElementById('snapshot');
+      if (img) img.src = '/snapshot?' + new Date().getTime();
+    }, 30000);
+  </script>
+
+</body>
+</html>
