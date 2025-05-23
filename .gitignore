@@ -3,3 +3,6 @@
 *.m3u8
 *.mp4
 *.jpg
+__pycache__
+*.log
+config.ini

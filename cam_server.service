@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=/home/kchauhan/services/rpi-usb-webcam
-ExecStart=/home/kchauhan/services/rpi-usb-webcam/.venv/bin/python3 /home/kchauhan/services/rpi-usb-webcam/app_v3.py
+ExecStart=/home/kchauhan/services/rpi-usb-webcam/.venv/bin/python3 /home/kchauhan/services/rpi-usb-webcam/app_v4.py
 Restart=always
 Environment=FLASK_ENV=production
 

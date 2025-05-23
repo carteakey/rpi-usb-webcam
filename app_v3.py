@@ -1,4 +1,4 @@
-from flask import Flask, send_from_directory, render_template, jsonify
+from flask import Flask, render_template, jsonify
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 import subprocess, os, threading, time, re
@@ -8,7 +8,7 @@ auth = HTTPBasicAuth()
 
 # Configure simple users
 users = {
-    "khushi": generate_password_hash("hasija")  # <-- Change this
+    "admin": generate_password_hash("password")  # <-- Change this
 }
 
 TIME_LAPSE_ROOT = "static/timelapse"
@@ -96,7 +96,7 @@ def start_hls_stream():
         "-flags", "low_delay",
         "static/hls/stream.m3u8"
     ],  stdin=arecord.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # Optional: redirect stderr to a log file
-    
+
 @app.route('/')
 @auth.login_required
 def index():
