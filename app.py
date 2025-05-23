@@ -8,7 +8,7 @@ auth = HTTPBasicAuth()
 
 # Configure simple users
 users = {
-    "khushi": generate_password_hash("hasija")  # <-- Change this
+    "admin": generate_password_hash("password")  # <-- Change this
 }
 
 TIME_LAPSE_ROOT = "static/timelapse"

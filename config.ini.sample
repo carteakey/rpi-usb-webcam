@@ -1,0 +1,29 @@
+[general]
+port = 8088
+host = 0.0.0.0
+debug = False
+snapshot_interval = 30
+max_days_to_keep = 7
+
+[video]
+device = /dev/video0
+resolution = 1280x720
+framerate = 30
+preset = ultrafast
+hls_time = 1
+hls_list_size = 5
+
+[audio]
+enabled = True
+device = hw:1,0
+sample_rate = 16000
+bit_rate = 96k
+
+[storage]
+snapshot_dir = static/snapshots
+hls_dir = static/hls
+timelapse_dir = static/timelapse
+
+[auth]
+username = admin
+password = password

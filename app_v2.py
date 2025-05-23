@@ -8,7 +8,7 @@ auth = HTTPBasicAuth()
 
 # Configure simple users
 users = {
-    "khushi": generate_password_hash("hasija")  # <-- Change this
+    "admin": generate_password_hash("password")  # <-- Change this
 }
 
 TIME_LAPSE_ROOT = "static/timelapse"
@@ -98,8 +98,8 @@ def start_hls_stream():
                     "-hls_flags", "delete_segments+append_list",
                     "static/hls/stream.m3u8"
                 ], stdin=arecord.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            
-                 
+
+
                 ffmpeg.wait()
                 print("❌ ffmpeg (audio+video) exited, restarting...")
                 arecord.kill()
@@ -124,7 +124,7 @@ def start_hls_stream():
 
     threading.Thread(target=run_stream, daemon=True).start()
 
-'''    
+'''
 def find_audio_device():
     try:
         result = subprocess.check_output(["arecord", "-l"], text=True)
