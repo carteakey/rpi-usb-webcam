@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request, send_from_directory, Response, redirect, url_for
+from flask import Flask, render_template, jsonify, request, send_from_directory, Response, redirect, url_for, session, flash
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 import subprocess, os, threading, time, re, json, logging, argparse, shutil
@@ -9,6 +9,9 @@ from pathlib import Path
 import configparser
 import sys
 import signal
+import secrets
+import uuid
+from collections import defaultdict
 
 # Initialize logging
 logging.basicConfig(
@@ -23,7 +26,18 @@ logger = logging.getLogger('webcam-server')
 
 # Create the Flask application
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
 auth = HTTPBasicAuth()
+
+# Track login attempts and lockouts
+login_attempts = defaultdict(list)  # {ip_address: [timestamp1, timestamp2, ...]}
+locked_out_ips = {}  # {ip_address: unlock_time}
+reset_tokens = {}  # {token: {'username': username, 'expiry': expiry_time}}
+
+# Handle authentication failures
+@auth.error_handler
+def auth_error():
+    return redirect('/login')
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -57,6 +71,10 @@ DEFAULT_CONFIG = {
         'username': 'khushi',
         # Default password is 'password' - this will be overridden by config file
         'password_hash': generate_password_hash('hasija'),
+        'security_question': 'What is your favorite color?',
+        'security_answer_hash': generate_password_hash('blue'),
+        'max_login_attempts': 10,
+        'lockout_duration': 30,  # minutes
     }
 }
 
@@ -105,6 +123,10 @@ def load_config(config_file='config.ini'):
         # Add default credentials but prompt user to change
         parser['auth']['username'] = 'admin'
         parser['auth']['password'] = 'change_this_password'
+        parser['auth']['security_question'] = 'What is your favorite color?'
+        parser['auth']['security_answer'] = 'change_this_answer'
+        parser['auth']['max_login_attempts'] = '10'
+        parser['auth']['lockout_duration'] = '30'
 
         with open(config_file, 'w') as f:
             parser.write(f)
@@ -140,11 +162,54 @@ def ensure_directories():
 @auth.verify_password
 def verify_password(username, password):
     """Verify username and password"""
+    # First check if user is already logged in via session
+    if session.get('logged_in') and session.get('username') == username:
+        return username
+    
     stored_username = config['auth']['username']
     stored_hash = config['auth']['password_hash']
-
+    
+    # Get client IP address
+    ip_address = request.remote_addr
+    
+    # Check if IP is locked out
+    if ip_address in locked_out_ips:
+        if datetime.now() < locked_out_ips[ip_address]:
+            # Still locked out
+            return None
+        else:
+            # Lockout period expired, remove from lockout dict
+            del locked_out_ips[ip_address]
+    
+    # Verify credentials
     if username == stored_username and check_password_hash(stored_hash, password):
+        # Successful login, clear any failed attempts for this IP
+        if ip_address in login_attempts:
+            del login_attempts[ip_address]
+        # Set session for HTTP Basic Auth users too
+        session['logged_in'] = True
+        session['username'] = username
         return username
+    else:
+        # Failed login attempt
+        max_attempts = int(config['auth'].get('max_login_attempts', 10))
+        lockout_duration = int(config['auth'].get('lockout_duration', 30))
+        
+        # Record the attempt
+        login_attempts[ip_address].append(datetime.now())
+        
+        # Check if we should lock out the IP
+        recent_attempts = [t for t in login_attempts[ip_address] 
+                           if t > datetime.now() - timedelta(hours=1)]
+        login_attempts[ip_address] = recent_attempts
+        
+        if len(recent_attempts) >= max_attempts:
+            # Lock out the IP
+            unlock_time = datetime.now() + timedelta(minutes=lockout_duration)
+            locked_out_ips[ip_address] = unlock_time
+            logger.warning(f"IP {ip_address} locked out until {unlock_time} due to too many failed login attempts")
+        
+        return None
 
 # Find available webcams
 def find_webcams():
@@ -680,12 +745,12 @@ def api_stream_control():
 def api_settings():
     """API endpoint to get or update settings"""
     if request.method == 'GET':
-        # Return current settings (excluding password hash)
+        # Return current settings (excluding password hash and security answer hash)
         settings = {}
         for section, values in config.items():
             settings[section] = {}
             for key, value in values.items():
-                if key != 'password_hash':
+                if key != 'password_hash' and key != 'security_answer_hash':
                     settings[section][key] = value
         return jsonify(settings)
     else:
@@ -697,11 +762,16 @@ def api_settings():
             for section, values in data.items():
                 if section in config:
                     for key, value in values.items():
-                        # Special handling for password
-                        if section == 'auth' and key == 'password':
-                            if value:  # Only update if not empty
-                                config['auth']['password_hash'] = generate_password_hash(value)
-                                updated = True
+                        # Special handling for password and security answer
+                        if section == 'auth':
+                            if key == 'password':
+                                if value:  # Only update if not empty
+                                    config['auth']['password_hash'] = generate_password_hash(value)
+                                    updated = True
+                            elif key == 'security_answer':
+                                if value:  # Only update if not empty
+                                    config['auth']['security_answer_hash'] = generate_password_hash(value)
+                                    updated = True
                         elif key in config[section]:
                             # Convert types as needed
                             if isinstance(config[section][key], bool):
@@ -754,6 +824,124 @@ def api_resolutions():
     resolutions = get_available_resolutions(device)
     return jsonify(resolutions)
 
+@app.route('/logout')
+def logout():
+    """Handle user logout"""
+    # Clear session
+    session.pop('logged_in', None)
+    session.pop('username', None)
+    # Redirect to login page
+    return redirect('/login')
+
+# Middleware to check if user is logged in for non-auth-protected routes
+@app.before_request
+def check_login():
+    # Define paths that don't require authentication
+    public_paths = ['/login', '/logout', '/reset-password', '/request-reset', '/static/']
+    
+    # Check if the path is public
+    if any(request.path.startswith(path) for path in public_paths):
+        return None
+    
+    # For API requests, let the @auth.login_required handle it
+    if request.path.startswith('/api/'):
+        return None
+    
+    # Check if user is logged in via session
+    if not session.get('logged_in'):
+        return redirect('/login')
+
+@app.route('/reset-password', methods=['GET', 'POST'])
+def reset_password():
+    """Handle password reset requests"""
+    if request.method == 'GET':
+        token = request.args.get('token')
+        if not token or token not in reset_tokens:
+            return render_template('reset_password.html', error='Invalid or expired reset token')
+        
+        # Valid token
+        token_data = reset_tokens[token]
+        if datetime.now() > token_data['expiry']:
+            # Token expired
+            del reset_tokens[token]
+            return render_template('reset_password.html', error='Reset token has expired')
+        
+        # Show the security question form
+        return render_template('reset_password.html', 
+                              security_question=config['auth']['security_question'],
+                              reset_token=token)
+    else:
+        # Handle form submission
+        token = request.form.get('reset_token')
+        if not token or token not in reset_tokens:
+            return render_template('reset_password.html', error='Invalid or expired reset token')
+        
+        token_data = reset_tokens[token]
+        if datetime.now() > token_data['expiry']:
+            # Token expired
+            del reset_tokens[token]
+            return render_template('reset_password.html', error='Reset token has expired')
+        
+        # Verify security answer
+        security_answer = request.form.get('security_answer')
+        if not security_answer or not check_password_hash(config['auth']['security_answer_hash'], security_answer):
+            return render_template('reset_password.html', 
+                                  error='Incorrect answer to security question',
+                                  security_question=config['auth']['security_question'],
+                                  reset_token=token)
+        
+        # Verify passwords match
+        new_password = request.form.get('new_password')
+        confirm_password = request.form.get('confirm_password')
+        
+        if not new_password or not confirm_password:
+            return render_template('reset_password.html', 
+                                  error='Please provide a new password',
+                                  security_question=config['auth']['security_question'],
+                                  reset_token=token)
+        
+        if new_password != confirm_password:
+            return render_template('reset_password.html', 
+                                  error='Passwords do not match',
+                                  security_question=config['auth']['security_question'],
+                                  reset_token=token)
+        
+        # Update password
+        config['auth']['password_hash'] = generate_password_hash(new_password)
+        save_config()
+        
+        # Delete the used token
+        del reset_tokens[token]
+        
+        # Show success message
+        return render_template('reset_password.html', success='Password has been reset successfully')
+
+@app.route('/request-reset', methods=['POST'])
+def request_reset():
+    """Handle password reset request"""
+    username = request.form.get('username')
+    if not username or username != config['auth']['username']:
+        # Always show the same message regardless of whether the username exists
+        # to avoid username enumeration
+        return render_template('reset_password.html', 
+                              success='If the username exists, a password reset link has been generated')
+    
+    # Generate reset token
+    token = str(uuid.uuid4())
+    expiry = datetime.now() + timedelta(hours=1)
+    reset_tokens[token] = {
+        'username': username,
+        'expiry': expiry
+    }
+    
+    # In a real application, you would send this link via email
+    # For this local application, we'll just display it
+    reset_url = f"/reset-password?token={token}"
+    logger.info(f"Password reset link generated: {reset_url}")
+    
+    return render_template('reset_password.html', 
+                          success=f'Password reset link: <a href="{reset_url}">{reset_url}</a>')
+
 # Handle graceful shutdown
 def signal_handler(sig, frame):
     """Handle termination signals"""
@@ -762,6 +950,69 @@ def signal_handler(sig, frame):
     running = False
     stop_streaming()
     sys.exit(0)
+
+# Add login page route (not protected by auth)
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Show login page and handle login form"""
+    if request.method == 'GET':
+        return render_template('login.html')
+    else:
+        # Handle login form submission
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        # Get client IP address
+        ip_address = request.remote_addr
+        
+        # Check if IP is locked out
+        if ip_address in locked_out_ips:
+            if datetime.now() < locked_out_ips[ip_address]:
+                # Still locked out
+                unlock_time = locked_out_ips[ip_address].strftime('%Y-%m-%d %H:%M:%S')
+                return render_template('login.html', locked_out=True, unlock_time=unlock_time)
+            else:
+                # Lockout period expired, remove from lockout dict
+                del locked_out_ips[ip_address]
+        
+        # Verify credentials
+        stored_username = config['auth']['username']
+        stored_hash = config['auth']['password_hash']
+        
+        if username == stored_username and check_password_hash(stored_hash, password):
+            # Successful login, clear any failed attempts for this IP
+            if ip_address in login_attempts:
+                del login_attempts[ip_address]
+            
+            # Generate a session token
+            session['logged_in'] = True
+            session['username'] = username
+            
+            # Redirect to home page
+            return redirect('/')
+        else:
+            # Failed login attempt
+            max_attempts = int(config['auth'].get('max_login_attempts', 10))
+            lockout_duration = int(config['auth'].get('lockout_duration', 30))
+            
+            # Record the attempt
+            login_attempts[ip_address].append(datetime.now())
+            
+            # Check if we should lock out the IP
+            recent_attempts = [t for t in login_attempts[ip_address] 
+                               if t > datetime.now() - timedelta(hours=1)]
+            login_attempts[ip_address] = recent_attempts
+            
+            if len(recent_attempts) >= max_attempts:
+                # Lock out the IP
+                unlock_time = datetime.now() + timedelta(minutes=lockout_duration)
+                locked_out_ips[ip_address] = unlock_time
+                logger.warning(f"IP {ip_address} locked out until {unlock_time} due to too many failed login attempts")
+                unlock_time_str = unlock_time.strftime('%Y-%m-%d %H:%M:%S')
+                return render_template('login.html', locked_out=True, unlock_time=unlock_time_str)
+            
+            # Show error message
+            return render_template('login.html', error='Invalid username or password')
 
 # Main application
 if __name__ == "__main__":

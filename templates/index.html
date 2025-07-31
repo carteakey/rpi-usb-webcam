@@ -16,6 +16,18 @@
       margin-bottom: 20px;
       background-color: #343a40;
     }
+    .user-info {
+      color: #fff;
+      margin-right: 15px;
+    }
+    .logout-link {
+      color: #fff;
+      text-decoration: none;
+    }
+    .logout-link:hover {
+      text-decoration: underline;
+      color: #f8f9fa;
+    }
     .nav-link.active {
       font-weight: bold;
       background-color: rgba(255,255,255,0.1);
@@ -112,6 +124,12 @@
             <a class="nav-link" href="#" onclick="switchView('system')">System</a>
           </li>
         </ul>
+        <div class="ms-auto d-flex align-items-center">
+          <div class="user-info">
+            Logged in as: {{ session.username }}
+          </div>
+          <a href="/logout" class="logout-link">Logout</a>
+        </div>
       </div>
     </div>
   </nav>
