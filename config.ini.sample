@@ -26,4 +26,7 @@ timelapse_dir = static/timelapse
 
 [auth]
 username = admin
-password = password
+; password_hash contains the Werkzeug-generated hash. Run:
+;   python app_v5.py --set-password
+; to interactively create one, or set WEBCAM_AUTH_PASSWORD at runtime.
+password_hash =

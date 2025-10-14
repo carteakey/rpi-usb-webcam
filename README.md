@@ -50,7 +50,7 @@ A simple and powerful web server for streaming USB webcam video with snapshots a
 On first run, a default `config.ini` file will be created. You can edit this file to change the default settings.
 
 Important configuration options:
-- `username` and `password` for authentication
+- `username` and `password_hash` for authentication (generate with `python app_v5.py --set-password` or set `WEBCAM_AUTH_PASSWORD`)
 - Video device path and resolution
 - Audio settings
 - Snapshot intervals
@@ -58,16 +58,52 @@ Important configuration options:
 
 You can also configure all settings through the web interface after logging in.
 
+Legacy application revisions are retained under `archive/` for reference.
+
+## Docker
+
+Build the container image:
+```
+docker build -t rpi-usb-webcam .
+```
+
+Run the container, supplying admin credentials and mapping the required devices/volumes as needed:
+```
+docker run --rm \
+  --name rpi-usb-webcam \
+  --device /dev/video0 \
+  -e WEBCAM_AUTH_PASSWORD=yourStrongPassword \
+  -p 8088:8088 \
+  rpi-usb-webcam
+```
+
+Mount persistent storage for HLS segments and snapshots if desired:
+```
+docker run --rm \
+  --name rpi-usb-webcam \
+  --device /dev/video0 \
+  -e WEBCAM_AUTH_PASSWORD=yourStrongPassword \
+  -p 8088:8088 \
+  -v ./static:/app/static \
+  rpi-usb-webcam
+```
+
 ## Usage
 
-1. Access the web interface by opening a browser and navigating to:
+1. Set an admin password before first use:
+   ```
+   python app_v5.py --set-password
+   ```
+   (or provide `WEBCAM_AUTH_PASSWORD` when starting the server)
+
+2. Access the web interface by opening a browser and navigating to:
    ```
    http://<raspberry-pi-ip>:8088
    ```
 
-2. Log in with your username and password (default: admin/change_this_password)
+3. Log in with your username and password.
 
-3. Use the web interface to:
+4. Use the web interface to:
    - View the live stream
    - Browse captured snapshots
    - Generate and view timelapse videos

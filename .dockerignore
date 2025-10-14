@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+archive/
+static/hls/
+static/snapshots/
+static/timelapse/
+config.ini
