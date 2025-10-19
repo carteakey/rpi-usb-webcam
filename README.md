@@ -60,32 +60,49 @@ The application uses FFmpeg to capture video from USB webcams and encode it into
 
 ## Installation
 
+### Standard Installation
+
 1. Clone this repository to your Raspberry Pi:
-   ```
-   git clone https://github.com/yourusername/rpi-usb-webcam.git
+   ```bash
+   git clone https://github.com/carteakey/rpi-usb-webcam.git
    cd rpi-usb-webcam
    ```
 
 2. Create a virtual environment and install dependencies:
-   ```
+   ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   pip install flask flask-httpauth psutil
+   pip install -r requirements.txt
    ```
 
 3. Install required system packages:
-   ```
+   ```bash
    sudo apt-get update
-   sudo apt-get install -y ffmpeg v4l-utils
+   sudo apt-get install -y ffmpeg v4l-utils alsa-utils
    ```
 
-4. Set up as a service:
-   ```
+4. Set up as a systemd service (optional, for automatic startup):
+   ```bash
+   # Edit cam_server.service to match your installation path
    sudo cp cam_server.service /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable cam_server
    sudo systemctl start cam_server
    ```
+
+### Quick Start (without systemd)
+
+For testing or development:
+
+```bash
+# Set admin password
+export WEBCAM_AUTH_PASSWORD=yourPassword123
+
+# Run the application
+python app_v5.py
+```
+
+Then open your browser to `http://<raspberry-pi-ip>:8088`
 
 ## Configuration
 
@@ -104,13 +121,18 @@ Legacy application revisions are retained under `archive/` for reference.
 
 ## Docker
 
-Build the container image:
-```
+Docker provides an isolated environment and simplifies deployment.
+
+### Build the Docker Image
+
+```bash
 docker build -t rpi-usb-webcam .
 ```
 
-Run the container, supplying admin credentials and mapping the required devices/volumes as needed:
-```
+### Basic Usage
+
+Run with password authentication:
+```bash
 docker run --rm \
   --name rpi-usb-webcam \
   --device /dev/video0 \
@@ -119,8 +141,10 @@ docker run --rm \
   rpi-usb-webcam
 ```
 
-Mount persistent storage for HLS segments and snapshots if desired:
-```
+### Persistent Storage
+
+Mount volumes for persistent snapshots and timelapses:
+```bash
 docker run --rm \
   --name rpi-usb-webcam \
   --device /dev/video0 \
@@ -130,26 +154,91 @@ docker run --rm \
   rpi-usb-webcam
 ```
 
+### Docker Compose
+
+Create a `docker-compose.yml` file:
+
+```yaml
+version: '3.8'
+
+services:
+  webcam:
+    build: .
+    container_name: rpi-usb-webcam
+    devices:
+      - /dev/video0:/dev/video0
+    environment:
+      - WEBCAM_AUTH_PASSWORD=yourStrongPassword
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./static:/app/static
+    restart: unless-stopped
+```
+
+Then run:
+```bash
+docker-compose up -d
+```
+
 ## Usage
 
-1. Set an admin password before first use:
-   ```
+### First Time Setup
+
+1. **Set an admin password** (choose one method):
+   
+   Using the interactive prompt:
+   ```bash
    python app_v5.py --set-password
    ```
-   (or provide `WEBCAM_AUTH_PASSWORD` when starting the server)
+   
+   Or via environment variable:
+   ```bash
+   export WEBCAM_AUTH_PASSWORD=yourStrongPassword
+   python app_v5.py
+   ```
 
-2. Access the web interface by opening a browser and navigating to:
+2. **Access the web interface**:
+   
+   Open a browser and navigate to:
    ```
    http://<raspberry-pi-ip>:8088
    ```
+   
+   Find your Raspberry Pi's IP address:
+   ```bash
+   hostname -I
+   ```
 
-3. Log in with your username and password.
+3. **Log in** with your credentials (default username: `admin`)
 
-4. Use the web interface to:
-   - View the live stream
-   - Browse captured snapshots
-   - Generate and view timelapse videos
-   - Configure all settings
+### Using the Web Interface
+
+Once logged in, you can:
+
+1. **View the Live Stream**
+   - The main page displays the live video feed
+   - Audio plays automatically if your webcam has a microphone
+   - Stream controls allow you to start/stop/restart the stream
+
+2. **Browse Snapshots**
+   - Navigate to the Snapshots section
+   - Select a date to view captures from that day
+   - Choose viewing interval: hourly, all, or sample
+
+3. **Generate Timelapses**
+   - Select a date with available snapshots
+   - Click "Generate Timelapse" to create a video
+   - Download the generated timelapse from the Timelapses section
+
+4. **Configure Settings**
+   - Access the Settings panel to configure:
+     - Video device and resolution
+     - Audio device and settings
+     - Snapshot intervals
+     - Storage locations
+     - Authentication credentials
+   - Changes are saved immediately and some may restart the stream
 
 ## Web Interface Features
 
