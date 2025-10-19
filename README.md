@@ -95,8 +95,8 @@ The application uses FFmpeg to capture video from USB webcams and encode it into
 For testing or development:
 
 ```bash
-# Set admin password
-export WEBCAM_AUTH_PASSWORD=yourPassword123
+# Set admin password (use a strong password)
+export WEBCAM_AUTH_PASSWORD='MyStr0ng!P@ssw0rd'
 
 # Run the application
 python app_v5.py
@@ -136,7 +136,7 @@ Run with password authentication:
 docker run --rm \
   --name rpi-usb-webcam \
   --device /dev/video0 \
-  -e WEBCAM_AUTH_PASSWORD=yourStrongPassword \
+  -e WEBCAM_AUTH_PASSWORD='MyStr0ng!P@ssw0rd' \
   -p 8088:8088 \
   rpi-usb-webcam
 ```
@@ -148,7 +148,7 @@ Mount volumes for persistent snapshots and timelapses:
 docker run --rm \
   --name rpi-usb-webcam \
   --device /dev/video0 \
-  -e WEBCAM_AUTH_PASSWORD=yourStrongPassword \
+  -e WEBCAM_AUTH_PASSWORD='MyStr0ng!P@ssw0rd' \
   -p 8088:8088 \
   -v ./static:/app/static \
   rpi-usb-webcam
@@ -159,8 +159,6 @@ docker run --rm \
 Create a `docker-compose.yml` file:
 
 ```yaml
-version: '3.8'
-
 services:
   webcam:
     build: .
@@ -168,7 +166,8 @@ services:
     devices:
       - /dev/video0:/dev/video0
     environment:
-      - WEBCAM_AUTH_PASSWORD=yourStrongPassword
+      # Consider using an .env file for sensitive values
+      - WEBCAM_AUTH_PASSWORD=${WEBCAM_AUTH_PASSWORD}
     ports:
       - "8088:8088"
     volumes:
@@ -176,9 +175,14 @@ services:
     restart: unless-stopped
 ```
 
+Create a `.env` file with your password:
+```
+WEBCAM_AUTH_PASSWORD=MyStr0ng!P@ssw0rd
+```
+
 Then run:
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ## Usage
@@ -192,9 +196,9 @@ docker-compose up -d
    python app_v5.py --set-password
    ```
    
-   Or via environment variable:
+   Or via environment variable (use a strong password with special characters):
    ```bash
-   export WEBCAM_AUTH_PASSWORD=yourStrongPassword
+   export WEBCAM_AUTH_PASSWORD='MyStr0ng!P@ssw0rd'
    python app_v5.py
    ```
 
