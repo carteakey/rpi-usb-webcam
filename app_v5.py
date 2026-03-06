@@ -74,6 +74,13 @@ arecord_process = None
 running = True
 stream_starting = threading.Event()
 
+# ── Viewer / idle state ───────────────────────────────────────────────────────
+VIEWER_TTL   = 60   # seconds — clients heartbeat every 30s
+IDLE_TIMEOUT = 120  # seconds with no viewers before pausing stream
+active_viewers: dict = {}
+viewer_lock = threading.Lock()
+stream_generation = 0
+
 def _stream_process_stderr(process, name, level=logging.ERROR):
     """Stream subprocess stderr lines into the application logger."""
     if not process or not process.stderr:
@@ -549,6 +556,8 @@ def start_hls_stream():
             _stream_process_stderr(ffmpeg_process, "ffmpeg")
 
         logger.info("HLS stream started successfully")
+        global stream_generation
+        stream_generation += 1
         return True
 
     except Exception as e:
@@ -782,6 +791,32 @@ def get_system_info():
             "version": "4.0.0"
         }
 
+# ── Watchdog: pause stream when idle ─────────────────────────────────────────
+def watchdog_thread():
+    idle_since = None
+    while running:
+        time.sleep(15)
+        now = time.time()
+        with viewer_lock:
+            stale = [k for k, t in active_viewers.items() if now - t > VIEWER_TTL]
+            for k in stale:
+                del active_viewers[k]
+            count = len(active_viewers)
+
+        if count > 0:
+            idle_since = None
+            if not is_stream_running():
+                logger.info("Viewer arrived — starting stream")
+                start_hls_stream()
+        else:
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= IDLE_TIMEOUT and is_stream_running():
+                logger.info("No viewers — pausing stream")
+                stop_streaming()
+                idle_since = None
+
+
 # Flask routes
 @app.route('/')
 @auth.login_required
@@ -816,6 +851,84 @@ def list_snapshot_dates():
 def list_timelapses():
     """List available timelapses"""
     return jsonify(get_timelapse_list())
+
+@app.route('/api/heartbeat', methods=['POST'])
+@auth.login_required
+def api_heartbeat():
+    sid = request.get_json(silent=True, force=True) or {}
+    sid = str(sid.get("sid", ""))[:64]
+    if sid:
+        with viewer_lock:
+            active_viewers[sid] = time.time()
+        if not is_stream_running():
+            logger.info("Viewer heartbeat — starting stream")
+            threading.Thread(target=start_hls_stream, daemon=True).start()
+    return "", 204
+
+
+@app.route('/api/viewers')
+@auth.login_required
+def api_viewers():
+    now = time.time()
+    with viewer_lock:
+        stale = [k for k, t in active_viewers.items() if now - t > VIEWER_TTL]
+        for k in stale:
+            del active_viewers[k]
+        count = len(active_viewers)
+    return jsonify({"count": count, "gen": stream_generation, "streaming": is_stream_running()})
+
+
+@app.route('/api/snapshots')
+@auth.login_required
+def api_snapshots_index():
+    snapshot_dir = Path(config['storage']['snapshot_dir'])
+    if not snapshot_dir.exists():
+        return jsonify([])
+    days = []
+    for d in sorted(snapshot_dir.iterdir(), reverse=True):
+        if not d.is_dir() or not re.match(r"^\d{4}-\d{2}-\d{2}$", d.name):
+            continue
+        jpgs = sorted(d.glob("*.jpg"))
+        if not jpgs:
+            continue
+        noon = 120000
+        pod = min(jpgs, key=lambda f: abs(int(f.stem) - noon))
+        days.append({"date": d.name, "count": len(jpgs), "pod": pod.name})
+    return jsonify(days[:30])
+
+
+@app.route('/api/disk')
+@auth.login_required
+def api_disk():
+    def dir_mb(p):
+        p = Path(p)
+        return round(sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1e6, 1) if p.exists() else 0
+    total, _, free = shutil.disk_usage("/")
+    return jsonify({
+        "snapshots_mb": dir_mb(config['storage']['snapshot_dir']),
+        "timelapse_mb": dir_mb(config['storage']['timelapse_dir']),
+        "free_gb":      round(free  / 1e9, 1),
+        "total_gb":     round(total / 1e9, 1),
+    })
+
+
+@app.route('/api/timelapse')
+@auth.login_required
+def api_timelapse_list():
+    tl_dir = Path(config['storage']['timelapse_dir'])
+    if not tl_dir.exists():
+        return jsonify([])
+    items = []
+    for mp4 in sorted(tl_dir.glob("*.mp4"), reverse=True):
+        items.append({"date": mp4.stem, "file": mp4.name, "size_mb": round(mp4.stat().st_size / 1e6, 1)})
+    return jsonify(items)
+
+
+@app.route('/timelapse')
+@auth.login_required
+def timelapse_page():
+    return render_template('timelapse.html')
+
 
 @app.route('/api/generate_timelapse', methods=['POST'])
 @auth.login_required
@@ -975,8 +1088,10 @@ if __name__ == "__main__":
     # Start background tasks
     logger.info("Starting snapshot capture thread")
     threading.Thread(target=snapshot_loop, daemon=True).start()
+    logger.info("Starting idle-stream watchdog")
+    threading.Thread(target=watchdog_thread, daemon=True).start()
 
-    # Start HLS stream
+    # Start HLS stream (will auto-pause when no viewers after IDLE_TIMEOUT)
     logger.info("Starting HLS stream")
     start_hls_stream()
 
