@@ -1038,6 +1038,12 @@ def api_resolutions():
     resolutions = get_available_resolutions(device)
     return jsonify(resolutions)
 
+@app.route('/hls/<path:filename>')
+@auth.login_required
+def serve_hls(filename):
+    """Serve HLS stream segments and playlist"""
+    return send_from_directory(config['storage']['hls_dir'], filename)
+
 # Handle graceful shutdown
 def signal_handler(sig, frame):
     """Handle termination signals"""
