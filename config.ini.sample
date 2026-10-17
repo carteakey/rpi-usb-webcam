@@ -30,3 +30,13 @@ username = admin
 ;   python app_v5.py --set-password
 ; to interactively create one, or set WEBCAM_AUTH_PASSWORD at runtime.
 password_hash =
+
+[location]
+name = Home
+latitude = 0.0
+longitude = 0.0
+timezone = UTC
+
+[recordings]
+dir = static/recordings
+duration = 600

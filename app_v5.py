@@ -1,7 +1,7 @@
 from flask import Flask, render_template, jsonify, request, send_from_directory, Response, redirect, url_for
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
-import subprocess, os, threading, time, re, json, logging, argparse, shutil, copy
+import subprocess, os, threading, time, re, json, logging, argparse, shutil, copy, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 import socket
 import psutil
@@ -57,7 +57,17 @@ DEFAULT_CONFIG = {
     'auth': {
         'username': 'admin',
         'password_hash': '',
-    }
+    },
+    'location': {
+        'name': 'Home',
+        'latitude': 0.0,
+        'longitude': 0.0,
+        'timezone': 'UTC',
+    },
+    'recordings': {
+        'dir': 'static/recordings',
+        'duration': 600,
+    },
 }
 
 # Global config dictionary
@@ -73,6 +83,7 @@ ffmpeg_process = None
 arecord_process = None
 running = True
 stream_starting = threading.Event()
+webcam_lock = threading.Lock()
 
 # ── Viewer / idle state ───────────────────────────────────────────────────────
 VIEWER_TTL   = 60   # seconds — clients heartbeat every 30s
@@ -80,6 +91,58 @@ IDLE_TIMEOUT = 120  # seconds with no viewers before pausing stream
 active_viewers: dict = {}
 viewer_lock = threading.Lock()
 stream_generation = 0
+
+# ── Weather ───────────────────────────────────────────────────────────────────
+WEATHER_TTL = 900  # 15-min cache
+_weather_cache: dict = {"data": None, "ts": 0.0}
+
+WMO_DESC = {
+    0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "showers", 81: "showers", 82: "heavy showers",
+    85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm", 99: "thunderstorm",
+}
+
+def fetch_weather():
+    lat = config['location']['latitude']
+    lon = config['location']['longitude']
+    tz  = urllib.parse.quote(config['location']['timezone'])
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,weather_code"
+        f"&daily=sunrise,sunset"
+        f"&timezone={tz}&forecast_days=1"
+    )
+    with urllib.request.urlopen(url, timeout=5) as r:
+        d = json.loads(r.read())
+    c = d["current"]
+    return {
+        "temp": round(c["temperature_2m"]),
+        "desc": WMO_DESC.get(c["weather_code"], ""),
+        "sunrise": d["daily"]["sunrise"][0],
+        "sunset":  d["daily"]["sunset"][0],
+    }
+
+def get_weather():
+    now = time.time()
+    if _weather_cache["data"] and now - _weather_cache["ts"] < WEATHER_TTL:
+        return _weather_cache["data"]
+    try:
+        data = fetch_weather()
+        _weather_cache["data"] = data
+        _weather_cache["ts"] = now
+        return data
+    except Exception:
+        return _weather_cache["data"] or {"temp": "--", "desc": "", "sunrise": None, "sunset": None}
+
+# ── Recording state ───────────────────────────────────────────────────────────
+_rec_lock  = threading.Lock()
+_rec_state: dict = {"status": "idle", "progress": 0.0, "file": None, "error": None}
 
 def _stream_process_stderr(process, name, level=logging.ERROR):
     """Stream subprocess stderr lines into the application logger."""
@@ -125,8 +188,10 @@ def load_config(config_file='config.ini', allow_empty_password=False):
                         continue
                 # Handle specific types
                 if key in ['port', 'snapshot_interval', 'framerate', 'hls_time',
-                          'hls_list_size', 'max_days_to_keep']:
+                          'hls_list_size', 'max_days_to_keep', 'duration']:
                     config[section][key] = int(value)
+                elif key in ['latitude', 'longitude']:
+                    config[section][key] = float(value)
                 elif key in ['debug', 'enabled']:
                     config[section][key] = parser.getboolean(section, key)
                 else:
@@ -238,6 +303,8 @@ def ensure_directories():
             if key.endswith('_dir') and isinstance(value, str):
                 os.makedirs(value, exist_ok=True)
                 logger.debug(f"Ensured directory exists: {value}")
+    os.makedirs('static/music', exist_ok=True)
+    os.makedirs(config['recordings']['dir'], exist_ok=True)
 
 def is_stream_running():
     """Check if the ffmpeg process is currently streaming"""
@@ -348,24 +415,43 @@ def snapshot_loop():
             if is_stream_running():
                 # Snapshot from HLS stream
                 logger.debug("Taking snapshot from HLS stream")
-                subprocess.run([
-                    "ffmpeg", "-y", "-i",
-                    os.path.join(config['storage']['hls_dir'], "stream.m3u8"),
-                    "-frames:v", "1", output_path
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                snapshot_taken = True
+                try:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i",
+                        os.path.join(config['storage']['hls_dir'], "stream.m3u8"),
+                        "-frames:v", "1", output_path
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    snapshot_taken = True
+                except subprocess.TimeoutExpired:
+                    logger.warning("Snapshot from HLS stream timed out")
             elif stream_starting.is_set():
                 logger.debug("Skipping snapshot while stream is restarting")
             else:
                 # Snapshot directly from webcam
-                logger.debug("Taking snapshot directly from webcam")
-                subprocess.run([
-                    "ffmpeg", "-y",
-                    "-f", "v4l2", "-video_size", config['video']['resolution'],
-                    "-i", config['video']['device'],
-                    "-vframes", "1", output_path
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                snapshot_taken = True
+                # Try to acquire lock without blocking for too long
+                acquired = webcam_lock.acquire(timeout=5)
+                if acquired:
+                    try:
+                        # Re-check status after acquiring lock
+                        if not is_stream_running() and not stream_starting.is_set():
+                            logger.debug("Taking snapshot directly from webcam")
+                            subprocess.run([
+                                "ffmpeg", "-y",
+                                "-f", "v4l2", "-video_size", config['video']['resolution'],
+                                "-i", config['video']['device'],
+                                "-vframes", "1", output_path
+                            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                            snapshot_taken = True
+                        else:
+                            logger.debug("Stream started/starting while waiting for lock, skipping direct snapshot")
+                    except subprocess.TimeoutExpired:
+                        logger.warning("Direct snapshot capture timed out")
+                    except Exception as e:
+                        logger.error(f"Error during direct snapshot: {e}")
+                    finally:
+                        webcam_lock.release()
+                else:
+                    logger.debug("Could not acquire webcam lock for snapshot, skipping")
 
             if snapshot_taken:
                 logger.debug(f"Snapshot saved to {output_path}")
@@ -409,158 +495,168 @@ def start_hls_stream():
 
     stream_starting.set()
     try:
-        # Ensure HLS directory exists
-        os.makedirs(config['storage']['hls_dir'], exist_ok=True)
-        hls_dir = Path(config['storage']['hls_dir'])
+        # Acquire lock to ensure we are the only ones opening the device
+        acquired = webcam_lock.acquire(timeout=20)
+        if not acquired:
+            logger.error("Could not acquire webcam lock to start HLS stream")
+            return False
 
-        # Remove stale HLS artifacts so clients don't see empty segments
         try:
-            for segment in hls_dir.glob("stream*.ts"):
-                segment.unlink(missing_ok=True)
-            (hls_dir / "stream.m3u8").unlink(missing_ok=True)
-        except Exception as cleanup_error:
-            logger.warning(f"Unable to clear old HLS files: {cleanup_error}")
+            # Ensure HLS directory exists
+            os.makedirs(config['storage']['hls_dir'], exist_ok=True)
+            hls_dir = Path(config['storage']['hls_dir'])
 
-        # Kill any existing processes
-        stop_streaming()
+            # Remove stale HLS artifacts so clients don't see empty segments
+            try:
+                for segment in hls_dir.glob("stream*.ts"):
+                    segment.unlink(missing_ok=True)
+                (hls_dir / "stream.m3u8").unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                logger.warning(f"Unable to clear old HLS files: {cleanup_error}")
 
-        logger.info(f"Starting HLS stream at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            # Kill any existing processes
+            stop_streaming()
 
-        # Video settings
-        video_device = config['video']['device']
-        resolution = config['video']['resolution']
-        framerate = config['video']['framerate']
-        preset = config['video']['preset']
-        hls_time = config['video']['hls_time']
-        hls_list_size = config['video']['hls_list_size']
+            logger.info(f"Starting HLS stream at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        ffmpeg_output_path = os.path.join(config['storage']['hls_dir'], "stream.m3u8")
+            # Video settings
+            video_device = config['video']['device']
+            resolution = config['video']['resolution']
+            framerate = config['video']['framerate']
+            preset = config['video']['preset']
+            hls_time = config['video']['hls_time']
+            hls_list_size = config['video']['hls_list_size']
 
-        # Base ffmpeg command
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel", "error"
-        ]
+            ffmpeg_output_path = os.path.join(config['storage']['hls_dir'], "stream.m3u8")
 
-        # Track whether we actually have an audio process feeding ffmpeg
-        active_audio_process = None
-
-        if config['audio']['enabled']:
-            audio_device = config['audio']['device']
-            sample_rate = config['audio']['sample_rate']
-            bit_rate = config['audio']['bit_rate']
-
-            arecord_cmd = [
-                "arecord",
-                "-D", audio_device,
-                "-f", "S16_LE",
-                "-c1",
-                "-r", str(sample_rate)
+            # Base ffmpeg command
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel", "error"
             ]
 
-            try:
-                logger.info(f"Starting audio capture: {' '.join(arecord_cmd)}")
-                arecord_process = subprocess.Popen(
-                    arecord_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
+            # Track whether we actually have an audio process feeding ffmpeg
+            active_audio_process = None
 
-                # Give arecord a moment to fail fast if the device is unavailable
-                time.sleep(0.2)
-                if arecord_process.poll() is not None:
-                    stderr_output = ""
-                    try:
-                        _, stderr_bytes = arecord_process.communicate(timeout=0.1)
-                        stderr_output = stderr_bytes.decode("utf-8", errors="ignore").strip()
-                    except Exception:
-                        pass
-                    logger.error(f"Audio capture exited immediately with code {arecord_process.returncode}. {stderr_output}")
-                    arecord_process = None
-                else:
-                    active_audio_process = arecord_process
-                    _stream_process_stderr(active_audio_process, "arecord")
-                    ffmpeg_cmd.extend([
-                        "-f", "s16le",
-                        "-ar", str(sample_rate),
-                        "-ac", "1",
-                        "-i", "pipe:0"
-                    ])
-            except Exception as e:
-                logger.error(f"Failed to start audio capture: {e}")
-                if arecord_process:
-                    arecord_process.terminate()
-                    try:
-                        arecord_process.wait(timeout=1)
-                    except Exception:
-                        pass
-                    arecord_process = None
+            if config['audio']['enabled']:
+                audio_device = config['audio']['device']
+                sample_rate = config['audio']['sample_rate']
+                bit_rate = config['audio']['bit_rate']
 
-        if not active_audio_process and config['audio']['enabled']:
-            logger.warning("Audio capture unavailable; falling back to video-only stream")
+                arecord_cmd = [
+                    "arecord",
+                    "-D", audio_device,
+                    "-f", "S16_LE",
+                    "-c1",
+                    "-r", str(sample_rate)
+                ]
 
-        # Append video input and output settings
-        ffmpeg_cmd.extend([
-            "-f", "v4l2",
-            "-framerate", str(framerate),
-            "-video_size", resolution,
-            "-i", video_device,
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-tune", "zerolatency",
-            "-x264opts", f"keyint={framerate}:min-keyint={framerate}:scenecut=0",
-        ])
+                try:
+                    logger.info(f"Starting audio capture: {' '.join(arecord_cmd)}")
+                    arecord_process = subprocess.Popen(
+                        arecord_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
 
-        if active_audio_process:
+                    # Give arecord a moment to fail fast if the device is unavailable
+                    time.sleep(0.5)
+                    if arecord_process.poll() is not None:
+                        stderr_output = ""
+                        try:
+                            _, stderr_bytes = arecord_process.communicate(timeout=0.1)
+                            stderr_output = stderr_bytes.decode("utf-8", errors="ignore").strip()
+                        except Exception:
+                            pass
+                        logger.error(f"Audio capture exited immediately with code {arecord_process.returncode}. {stderr_output}")
+                        arecord_process = None
+                    else:
+                        active_audio_process = arecord_process
+                        _stream_process_stderr(active_audio_process, "arecord", level=logging.INFO)
+                        ffmpeg_cmd.extend([
+                            "-f", "s16le",
+                            "-ar", str(sample_rate),
+                            "-ac", "1",
+                            "-i", "pipe:0"
+                        ])
+                except Exception as e:
+                    logger.error(f"Failed to start audio capture: {e}")
+                    if arecord_process:
+                        arecord_process.terminate()
+                        try:
+                            arecord_process.wait(timeout=1)
+                        except Exception:
+                            pass
+                        arecord_process = None
+
+            if not active_audio_process and config['audio']['enabled']:
+                logger.warning("Audio capture unavailable; falling back to video-only stream")
+
+            # Append video input and output settings
             ffmpeg_cmd.extend([
-                "-c:a", "aac",
-                "-b:a", bit_rate
+                "-f", "v4l2",
+                "-framerate", str(framerate),
+                "-video_size", resolution,
+                "-i", video_device,
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-tune", "zerolatency",
+                "-x264opts", f"keyint={framerate}:min-keyint={framerate}:scenecut=0",
             ])
 
-        ffmpeg_cmd.extend([
-            "-f", "hls",
-            "-hls_time", str(hls_time),
-            "-hls_list_size", str(hls_list_size),
-            "-hls_flags", "delete_segments+append_list+omit_endlist",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            ffmpeg_output_path
-        ])
+            if active_audio_process:
+                ffmpeg_cmd.extend([
+                    "-c:a", "aac",
+                    "-b:a", bit_rate
+                ])
 
-        logger.info(f"Starting ffmpeg{' with audio' if active_audio_process else ''}: {' '.join(ffmpeg_cmd)}")
+            ffmpeg_cmd.extend([
+                "-f", "hls",
+                "-hls_time", str(hls_time),
+                "-hls_list_size", str(hls_list_size),
+                "-hls_flags", "delete_segments+append_list+omit_endlist",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                ffmpeg_output_path
+            ])
 
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=active_audio_process.stdout if active_audio_process else None,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
+            logger.info(f"Starting ffmpeg{' with audio' if active_audio_process else ''}: {' '.join(ffmpeg_cmd)}")
 
-        if active_audio_process:
-            # Close our copy of the stdout pipe so ffmpeg is the only reader
-            active_audio_process.stdout.close()
+            ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=active_audio_process.stdout if active_audio_process else None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
 
-        # Give ffmpeg a moment to report any immediate failure
-        time.sleep(0.5)
-        if ffmpeg_process.poll() is not None:
-            stderr_output = ""
-            try:
-                stderr_output = ffmpeg_process.stderr.read().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                pass
-            logger.error(f"ffmpeg exited immediately with code {ffmpeg_process.returncode}. {stderr_output}")
-            stop_streaming()
-            return False
-        else:
-            _stream_process_stderr(ffmpeg_process, "ffmpeg")
+            if active_audio_process:
+                # Close our copy of the stdout pipe so ffmpeg is the only reader
+                active_audio_process.stdout.close()
 
-        logger.info("HLS stream started successfully")
-        global stream_generation
-        stream_generation += 1
-        return True
+            # Give ffmpeg a moment to report any immediate failure
+            time.sleep(1.0)
+            if ffmpeg_process.poll() is not None:
+                stderr_output = ""
+                try:
+                    stderr_output = ffmpeg_process.stderr.read().decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    pass
+                logger.error(f"ffmpeg exited immediately with code {ffmpeg_process.returncode}. {stderr_output}")
+                stop_streaming()
+                return False
+            else:
+                _stream_process_stderr(ffmpeg_process, "ffmpeg", level=logging.INFO)
+
+            logger.info("HLS stream started successfully")
+            global stream_generation
+            stream_generation += 1
+            return True
+        finally:
+            webcam_lock.release()
 
     except Exception as e:
+
         logger.error(f"Error starting HLS stream: {e}")
         stop_streaming()
         return False
@@ -823,7 +919,8 @@ def watchdog_thread():
 def index():
     """Main application page"""
     system_info = get_system_info()
-    return render_template('index.html', system_info=system_info)
+    location = config['location']['name']
+    return render_template('index.html', system_info=system_info, location=location)
 
 @app.route('/snapshots')
 @auth.login_required
@@ -1042,7 +1139,112 @@ def api_resolutions():
 @auth.login_required
 def serve_hls(filename):
     """Serve HLS stream segments and playlist"""
-    return send_from_directory(config['storage']['hls_dir'], filename)
+    mime = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
+    resp = send_from_directory(config['storage']['hls_dir'], filename, mimetype=mime)
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
+
+@app.route('/api/weather')
+@auth.login_required
+def api_weather():
+    """Get current weather for configured location"""
+    return jsonify(get_weather())
+
+
+@app.route('/api/music')
+@auth.login_required
+def api_music():
+    """List available music tracks"""
+    music_dir = Path('static/music')
+    if not music_dir.exists():
+        return jsonify([])
+    tracks = sorted(
+        f.name for f in music_dir.iterdir()
+        if f.suffix.lower() in {'.mp3', '.ogg', '.flac', '.wav', '.m4a'}
+    )
+    return jsonify(tracks)
+
+
+def _do_record(output_path):
+    """Record a clip by reading directly from the live HLS stream on disk."""
+    global _rec_state
+    hls_path = os.path.join(config['storage']['hls_dir'], 'stream.m3u8')
+    duration = config['recordings']['duration']
+    try:
+        proc = subprocess.Popen(
+            [
+                'ffmpeg', '-y',
+                '-i', hls_path,
+                '-t', str(duration),
+                '-c:v', 'copy', '-an',
+                '-progress', 'pipe:2',
+                str(output_path),
+            ],
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+        )
+        for raw in proc.stderr:
+            line = raw.decode(errors='ignore').strip()
+            if line.startswith('out_time_us='):
+                try:
+                    elapsed = int(line.split('=')[1]) / 1_000_000
+                    with _rec_lock:
+                        _rec_state['progress'] = min(99.0, elapsed / duration * 100)
+                except ValueError:
+                    pass
+        proc.wait()
+        if proc.returncode == 0:
+            with _rec_lock:
+                _rec_state.update({'status': 'done', 'progress': 100.0, 'file': Path(output_path).name})
+        else:
+            with _rec_lock:
+                _rec_state.update({'status': 'error', 'error': 'ffmpeg failed'})
+    except Exception as e:
+        with _rec_lock:
+            _rec_state.update({'status': 'error', 'error': str(e)})
+
+
+@app.route('/api/record', methods=['POST'])
+@auth.login_required
+def api_record_start():
+    global _rec_state
+    with _rec_lock:
+        if _rec_state['status'] == 'recording':
+            return jsonify({'error': 'already recording'}), 409
+        _rec_state = {'status': 'recording', 'progress': 0.0, 'file': None, 'error': None}
+    rec_dir = Path(config['recordings']['dir'])
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+    out = rec_dir / f'clip_{ts}.mp4'
+    threading.Thread(target=_do_record, args=(out,), daemon=True).start()
+    return jsonify({'status': 'recording'})
+
+
+@app.route('/api/record/status')
+@auth.login_required
+def api_record_status():
+    with _rec_lock:
+        return jsonify(dict(_rec_state))
+
+
+@app.route('/api/record/download/<path:filename>')
+@auth.login_required
+def api_record_download(filename):
+    return send_from_directory(config['recordings']['dir'], filename, as_attachment=True)
+
+
+@app.route('/manifest.json')
+def manifest():
+    return jsonify({
+        'name': 'webcam',
+        'short_name': 'webcam',
+        'display': 'fullscreen',
+        'orientation': 'landscape',
+        'background_color': '#000000',
+        'theme_color': '#000000',
+        'start_url': '/',
+    })
+
 
 # Handle graceful shutdown
 def signal_handler(sig, frame):
@@ -1091,15 +1293,15 @@ if __name__ == "__main__":
     # Ensure required directories exist
     ensure_directories()
 
+    # Start HLS stream (will auto-pause when no viewers after IDLE_TIMEOUT)
+    logger.info("Starting HLS stream")
+    start_hls_stream()
+
     # Start background tasks
     logger.info("Starting snapshot capture thread")
     threading.Thread(target=snapshot_loop, daemon=True).start()
     logger.info("Starting idle-stream watchdog")
     threading.Thread(target=watchdog_thread, daemon=True).start()
-
-    # Start HLS stream (will auto-pause when no viewers after IDLE_TIMEOUT)
-    logger.info("Starting HLS stream")
-    start_hls_stream()
 
     # Start Flask application
     logger.info(f"Starting web server on {config['general']['host']}:{config['general']['port']}")
