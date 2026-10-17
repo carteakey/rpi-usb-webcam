@@ -1,3 +1,5 @@
+> **Moved:** this project now lives in [`carteakey/window.carteakey.dev` → `usb-webcam/`](https://github.com/carteakey/window.carteakey.dev/tree/main/usb-webcam), with full history. This repo is archived.
+
 # Raspberry Pi USB Webcam Server
 
 A lightweight, feature-rich web server for streaming USB webcam video on Raspberry Pi. Transform your Raspberry Pi and any USB webcam into a complete surveillance and monitoring solution with live streaming, automatic snapshots, and timelapse video generation.
